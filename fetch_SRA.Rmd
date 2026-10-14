@@ -1,0 +1,988 @@
+---
+title: "fetch_SRA Pipeline"
+author: "Moises A. Rojas"
+date: "09/10/2026"
+output: html_document
+---
+
+```{r setup include=FALSE}
+suppressMessages(library(tidyverse)) #tidy ecosystem
+suppressMessages(library(purrr)) #mapping functions
+suppressMessages(library(GEOquery)) #GSE accession
+suppressMessages(library(rentrez)) #NCBI Eutils API
+suppressMessages(library(recount3)) #uniformly processed RNA-seq data
+suppressMessages(library(edgeR)) #DGE objects
+```
+
+## Input studies
+
+Read input studies (GSE ID required in the `accession` column).
+
+```{r input}
+input_studies <- tribble(
+  ~accession,  ~disease,
+  "GSE125583", "AD",
+  "GSE203206", "AD"
+)
+glimpse(input_studies)
+
+# Or read config file instead
+#input_studies <- read.csv("config/input_studies.csv")
+
+# Validate only GSE
+if (!all(grepl("^GSE[0-9]+$", input_studies$accession))) {
+  stop("All accession values must be valid GSE accessions.", call. = FALSE)
+}
+```
+
+## Inspect input GSE studies
+
+```{r inspect}
+# Inspect one GSE without downloading count matrices
+inspect_gse <- function(gse_id) {
+  stopifnot(grepl("^GSE[0-9]+$", gse_id))
+  
+  # Retrieve series and sample metadata
+  geo <- getGEO(
+    gse_id,
+    GSEMatrix = TRUE,
+    getGPL = FALSE,
+    destdir = tempdir() #avoid creating the GSE dir.
+  )
+  
+  metadata <- map_dfr(
+    geo,
+    ~ Biobase::pData(.x) %>%
+      tibble::rownames_to_column("sample_id")
+  )
+  
+  # List supplementary files (without downloading)
+  supp <- tryCatch(
+    getGEOSuppFiles(
+      gse_id,
+      fetch_files = FALSE,
+      baseDir = tempdir() #avoid creating the GSE dir.
+    ),
+    error = function(e) NULL
+  )
+  
+  # Identify candidate count files
+  count_files <- if(!is.null(supp)) {
+    supp[
+      grepl(
+        "raw_counts|counts|count_matrix",
+        rownames(supp),
+        ignore.case = TRUE
+      ),
+      ,
+      drop = FALSE
+    ]
+  } else {
+    NULL
+  }
+  
+  list(
+    accession = gse_id,
+    metadata = metadata,
+    n_samples = nrow(metadata),
+    supplementary = supp,
+    count_files = count_files
+  )
+}
+
+# Inspect list of input studies
+gse_info <- map(
+  input_studies$accession,
+  inspect_gse
+)
+```
+## Download NCBI-computed gene counts
+
+```{r rawcounts}
+# Function to download files from the NCBI-generated data
+download_gse_counts <- function(
+    gse_id,
+    counts_dir = "data_ncbi/counts",
+    annotation_dir = "data_ncbi/annotation",
+    overwrite = FALSE
+  ) {
+  
+  gse_id <- toupper(trimws(gse_id))
+  
+  stopifnot(grepl("^GSE[0-9]+$", gse_id))
+  
+  dir.create(counts_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(annotation_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # NCBI-generated filenames
+  counts_file <- paste0(gse_id, "_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+  annotation_file <- "Human.GRCh38.p13.annot.tsv.gz"
+  
+  # NCBI download endpoint
+  make_url <- function(filename, accession = NULL) {
+    base_url <- "https://www.ncbi.nlm.nih.gov/geo/download/"
+    
+    params <- c(
+      "format=file",
+      "type=rnaseq_counts",
+      if (!is.null(accession)) {
+        paste0("acc=", accession)
+      },
+      paste0("file=", filename)
+    )
+    
+    paste0(base_url, "?", paste(params, collapse = "&"))
+  }
+  
+  # Series raw counts
+  counts_url <- make_url(counts_file, accession = gse_id)
+  
+  # Shared human annotation
+  annotation_url <- make_url(annotation_file)
+  
+  # Print
+  cat("Counts:", counts_url, "\n")
+  cat("Annotation:", annotation_url, "\n")
+  
+  # Create file paths
+  counts_path <- file.path(counts_dir, counts_file)
+  annotation_path <- file.path(annotation_dir, annotation_file)
+  
+  # Check gzip signature and first readable line
+  valid_gzip <- function(path) {
+    if (!file.exists(path) ||
+        file.info(path)$size < 100) {
+      return(FALSE)
+    }
+    
+    con <- file(path, open = "rb")
+    magic <- readBin(con, "raw", n = 2)
+    close(con)
+    
+    if (!identical(magic, as.raw(c(0x1f, 0x8b)))) {
+      return(FALSE)
+    }
+    
+    tryCatch({
+      con <- gzfile(path, "rt")
+      on.exit(close(con), add = TRUE)
+      length(readLines(con, n = 1, warn = FALSE)) == 1
+    }, error = function(e) FALSE)
+  }
+  
+  # Reusable downloader
+  fetch_file <- function(url, dest) {
+    if (!overwrite && valid_gzip(dest)) {
+      message("Already downloaded: ", basename(dest))
+      return(dest)
+    }
+    
+    tmp <- paste0(dest, ".part")
+    if (file.exists(tmp)) unlink(tmp)
+    
+    message("Downloading: ", basename(dest))
+    
+    tryCatch({
+      download.file(
+        url = url,
+        destfile = tmp,
+        method = "libcurl",
+        mode = "wb",
+        quiet = TRUE,
+        timeout = 600
+      )
+      
+      if (!valid_gzip(tmp)) {
+        stop("Invalid gzip file or unavailable resource")
+      }
+      
+      if (file.exists(dest)) unlink(dest)
+      
+      if (!file.rename(tmp, dest)) {
+        stop("Could not move downloaded file")
+      }
+      
+      dest
+    }, error = function(e) {
+      if (file.exists(tmp)) unlink(tmp)
+      
+      warning(
+        "Failed: ", basename(dest),
+        " — ", conditionMessage(e)
+      )
+      
+      NA_character_
+    })
+  }
+  
+  # Download raw counts and shared annotation
+  counts_result <- fetch_file(counts_url, counts_path)
+  #annotation_result <- fetch_file(annotation_url, annotation_path)
+  
+  tibble(
+    accession = gse_id,
+    counts_path = counts_result,
+    #annotation_path = annotation_result,
+    counts_downloaded = !is.na(counts_result),
+    #annotation_downloaded = !is.na(annotation_result)
+  )
+}
+
+# Batch screening of multiple studies
+download_result <- map(
+  input_studies$accession,
+  download_gse_counts
+) #download_gse_counts("GSE113524")
+```
+
+## Download study metadata
+
+```{r metadata}
+# Function to resolve SRP using Entrez
+resolve_srp_entrez <- function(gse_id) {
+  # Search GEO DataSets for the exact GSE
+  gds <- entrez_search(
+    db = "gds",
+    term = paste0(gse_id, "[ACCN] AND gse[ETYP]")
+  )
+  
+  if (length(gds$ids) == 0L) {
+    return(NA_character_)
+  }
+  
+  # Find linked SRA experiment records
+  links <- entrez_link(
+    dbfrom = "gds",
+    db = "sra",
+    id = gds$ids,
+    cmd = "neighbor"
+  )
+  
+  sra_ids <- links$links$gds_sra
+  
+  if (is.null(sra_ids) || length(sra_ids) == 0L) {
+    return(NA_character_)
+  }
+  
+  # Retrieve RunInfo metadata
+  csv_text <- entrez_fetch(
+    db = "sra",
+    id = sra_ids,
+    rettype = "runinfo",
+    retmode = "text"
+  )
+  
+  runinfo <- read_csv(
+    I(csv_text),
+    col_types = readr::cols(.default = "c"),
+    show_col_types = FALSE
+  )
+  
+  if (!"SRAStudy" %in% names(runinfo)) {
+    return(NA_character_)
+  }
+  
+  # Extract unique SRP accessions
+  srp <- unique(runinfo$SRAStudy)
+  
+  srp <- srp[
+    !is.na(srp) &
+      grepl("^SRP[0-9]+$", srp)
+  ]
+  
+  if (length(srp) == 1L) {
+    return(srp)
+  }
+  
+  if (length(srp) > 1L) {
+    warning(
+      "Multiple SRP accessions found for ",
+      gse_id, ": ",
+      paste(srp, collapse = ", ")
+    )
+  }
+  
+  NA_character_
+}
+
+# Function to convert GSE to SRP accessions
+resolve_sra_accession <- function(accession, strict = FALSE) {
+  accession <- toupper(trimws(accession))
+  
+  # Helper for unsuccessful resolution
+  fail <- function(message) {
+    if (strict) stop(message, call. = FALSE)
+    warning(message, call. = FALSE)
+    NA_character_
+  }
+  
+  # Validate input
+  if (length(accession) != 1L ||
+      is.na(accession) ||
+      !grepl("^(GSE|SRP)[0-9]+$", accession)) {
+    return(fail("Invalid GSE/SRP accession format"))
+  }
+  
+  # Already an SRA project
+  if (grepl("^SRP[0-9]+$", accession)) {
+    return(accession)
+  }
+  
+  message("Resolving GSE to SRP: ", accession)
+  
+  # 1. Try Entrez first
+  srp <- tryCatch(
+    resolve_srp_entrez(accession), #GEO–SRA linkage
+    error = function(e) {
+      warning("Entrez lookup failed: ", conditionMessage(e))
+      NA_character_
+    }
+  )
+  
+  if (length(srp) == 1L && !is.na(srp)) {
+    message(accession, " -> ", srp)
+    return(srp)
+  }
+  
+  # 2. Fall back to GEOquery
+  message("Entrez lookup unsuccessful. Trying GEOquery...")
+  
+  # Retrieve GEO series metadata
+  geo <- tryCatch(
+    getGEO(
+      accession,
+      GSEMatrix = FALSE,
+      getGPL = FALSE,
+      destdir = tempdir()
+    ),
+    error = function(e) {
+      message("GEOquery lookup failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+  
+  if (is.null(geo)) {
+    return(fail(
+      paste("Could not retrieve GEO accession:", accession)
+    ))
+  }
+  
+  # Extract GEO series relations field
+  relations <- GEOquery::Meta(geo)$relation
+  
+  if (is.null(relations)) {
+    return(fail(
+      paste("No SRA relation found for:", accession)
+    ))
+  }
+  
+  relations <- unlist(relations, use.names = FALSE)
+  
+  # Extract linked SRP accessions
+  srp <- unique(unlist(
+    regmatches(
+      relations,
+      gregexpr("SRP[0-9]+", relations)
+    ),
+    use.names = FALSE
+  ))
+  
+  # 3. Validate final result
+  if (length(srp) == 0L) {
+    return(fail(
+      paste("No linked SRP found for:", accession)
+    ))
+  }
+  
+  if (length(srp) > 1L) {
+    return(fail(
+      paste(
+        "Multiple SRP accessions found for:",
+        accession,
+        paste(srp, collapse = ", ")
+      )
+    ))
+  }
+  
+  message(accession, " -> ", srp)
+  
+  return(srp)
+}
+
+# Access to the 'SraRunInfo.csv' file
+download_sra_metadata <- function(
+    accession,
+    outdir = "data_ncbi/metadata",
+    overwrite = FALSE
+  ) {
+  
+  accession <- toupper(trimws(accession))
+  stopifnot(grepl("^(GSE|SRP)[0-9]+$", accession))
+  
+  study_dir <- file.path(outdir, accession)
+  dir.create(study_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  dest <- file.path(study_dir, "SraRunInfo.csv")
+  
+  if (file.exists(dest) && !overwrite) {
+    message("Already downloaded: ", dest)
+    return(dest)
+  }
+  
+  # Search the SRA database
+  search <- entrez_search(
+    db = "sra",
+    term = paste0(accession, "[All Fields]"),
+    use_history = TRUE,
+    retmax = 0
+  )
+  
+  if (search$count == 0) {
+    stop("No SRA records found: ", accession)
+  }
+  
+  # Retrieve metadata using E-utilities
+  csv_text <- entrez_fetch(
+    db = "sra",
+    web_history = search$web_history,
+    rettype = "runinfo",
+    retmode = "text"
+  )
+  
+  metadata <- read_csv(
+    I(csv_text),
+    col_types = cols(.default = "c"),
+    show_col_types = FALSE
+  )
+  
+  if (!"Run" %in% names(metadata) ||
+      nrow(metadata) == 0) {
+    stop("Invalid RunInfo response: ", accession)
+  }
+  
+  write_csv(metadata, dest)
+  
+  message(
+    "Saved ", nrow(metadata),
+    " sequencing runs: ", dest
+  )
+  
+  dest
+}
+
+# Access to the 'SraRunTable.csv' file
+download_sra_run_table <- function(
+    accession,
+    outdir = "data_ncbi/metadata",
+    batch_size = 100L,
+    overwrite = FALSE
+  ) {
+  
+  accession <- toupper(trimws(accession))
+  stopifnot(grepl("^(GSE|SRP)[0-9]+$", accession))
+  
+  study_dir <- file.path(outdir, accession)
+  dir.create(study_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  dest <- file.path(study_dir, "SraRunTable.csv")
+  
+  if (file.exists(dest) && !overwrite) {
+    message("Already downloaded: ", dest)
+    return(dest)
+  }
+  
+  # Search NCBI SRA
+  search <- entrez_search(
+    db = "sra",
+    term = paste0(accession, "[All Fields]"),
+    retmax = 0,
+    use_history = TRUE
+  )
+  
+  if (search$count == 0) {
+    stop("No SRA records found for ", accession)
+  }
+  
+  # Extract one record's attributes
+  parse_package <- function(pkg) {
+    experiment <- xml2::xml_text(
+      xml2::xml_find_first(
+        pkg, "./EXPERIMENT/@accession"
+      )
+    )
+    
+    # Experiment accession from XML attribute
+    experiment <- xml2::xml_attr(
+      xml2::xml_find_first(pkg, "./EXPERIMENT"),
+      "accession"
+    )
+    
+    # Retrieve runs for this experiment
+    runs <- xml2::xml_attr(
+      xml2::xml_find_all(pkg, "./RUN_SET/RUN"),
+      "accession"
+    )
+    
+    if (length(runs) == 0) return(NULL)
+    
+    # Submitted sample attributes
+    nodes <- xml2::xml_find_all(
+      pkg, "./SAMPLE/SAMPLE_ATTRIBUTES/SAMPLE_ATTRIBUTE"
+    )
+    
+    tags <- xml2::xml_text(
+      xml2::xml_find_all(nodes, "./TAG")
+    )
+    
+    values <- xml2::xml_text(
+      xml2::xml_find_all(nodes, "./VALUE")
+    )
+    
+    attrs <- tibble(
+      name = tags,
+      value = values
+    ) %>%
+      dplyr::filter(!is.na(name), nzchar(name)) %>%
+      dplyr::mutate(
+        name = trimws(name),
+        value = trimws(value)
+      ) %>%
+      dplyr::group_by(name) %>%
+      dplyr::summarise(
+        value = paste(unique(value), collapse = "; "),
+        .groups = "drop"
+      )
+    
+    # Convert tags into individual columns
+    wide <- if (nrow(attrs) > 0) {
+      pivot_wider(
+        attrs,
+        names_from = name,
+        values_from = value,
+        names_prefix = "attr_"
+      )
+    } else {
+      tibble(.placeholder = NA_character_) %>%
+        dplyr::select(-.placeholder)
+    }
+    
+    tibble(
+      Run = runs,
+      Experiment = experiment
+    ) %>%
+      bind_cols(wide[rep(1, length(runs)), , drop = FALSE])
+  }
+  
+  # Fetch XML in batches
+  starts <- seq(
+    0, search$count - 1,
+    by = batch_size
+  )
+  
+  results <- map_dfr(starts, function(start) {
+    message(
+      "Fetching records ",
+      start + 1, "–",
+      min(start + batch_size, search$count)
+    )
+    
+    xml_text <- rentrez::entrez_fetch(
+      db = "sra",
+      web_history = search$web_history,
+      rettype = "xml",
+      retmode = "xml",
+      retstart = start,
+      retmax = batch_size
+    )
+    
+    doc <- xml2::read_xml(xml_text)
+    
+    packages <- xml2::xml_find_all(
+      doc, ".//EXPERIMENT_PACKAGE"
+    )
+    
+    map_dfr(packages, parse_package)
+  })
+  
+  if (nrow(results) == 0) {
+    stop("No run metadata extracted")
+  }
+  
+  # Add standard sequencing information
+  runinfo_path <- download_sra_metadata(accession, outdir = outdir)
+  
+  runinfo <- read_csv(runinfo_path, col_types = cols(.default = "c"))
+  
+  # One row per SRR run
+  results <- runinfo %>%
+    left_join(
+      results %>%
+        dplyr::select(-Experiment),
+      by = "Run"
+    )
+  
+  write_csv(results, dest)
+  
+  message("Saved ", nrow(results), " runs: ", dest)
+  
+  dest
+}
+
+# Convert GSE to SRP preserving study information
+input_studies <- input_studies %>%
+  dplyr::mutate(
+    srp_id = map_chr(
+      accession,
+      resolve_sra_accession #eg. resolve_sra_accession("GSE203206")
+    )
+  )
+
+# Download metadata for the converted SRP studies
+input_studies <- input_studies %>%
+  dplyr::mutate(
+    metadata_path = purrr::map_chr(
+      srp_id,
+      \(x) {
+        if(is.na(x)) {
+          NA_character_
+        } else {
+          download_sra_run_table(x)
+        }
+      }
+    )
+  )
+```
+
+## Export edgeR object
+
+Validate the retrieved data and create an exportable DGEList object compatible with edgeR for downstream analysis. If multiple GSE studies are available, combine their count matrices by columns and export them as a single file. In addition, generate a summary report (`dge_raw_summary.csv`) describing the processed accession studies and general dataset metrics, such as the number of samples and genes.
+
+```{r export}
+# Helper function to retrieve the count matrix and its corresponding metadata
+read_study_data <- function(
+    accession,
+    disease,
+    srp_id,
+    metadata_path,
+    counts_dir = "data_ncbi/counts"
+  ) {
+  
+  # 1. Read NCBI raw counts
+  counts_path <- file.path(
+    counts_dir,
+    paste0(
+      accession,
+      "_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+    )
+  )
+  
+  if (!file.exists(counts_path)) {
+    stop("Count matrix not found: ", counts_path)
+  }
+  
+  counts_df <- read_tsv(
+    counts_path,
+    show_col_types = FALSE
+  )
+  
+  # First column contains gene ids (`GeneID`)
+  gene_ids <- as.character(counts_df[[1]])
+  
+  if (anyNA(gene_ids) || anyDuplicated(gene_ids)) {
+    stop("Missing or duplicated gene ids: ", accession)
+  }
+  
+  # Other columns must contain numeric raw counts
+  count_data <- counts_df[-1]
+  
+  if (!all(vapply(count_data, is.numeric, logical(1)))) {
+    stop("Non-numeric count columns: ", accession)
+  }
+  
+  counts <- as.matrix(count_data)
+  rownames(counts) <- gene_ids
+  
+  # Validate original counts
+  stopifnot(
+    !anyNA(counts),
+    all(is.finite(counts)),
+    all(counts >= 0),
+    all(counts == round(counts)),
+    !anyDuplicated(colnames(counts))
+  )
+  
+  # 2. Read SRA metadata
+  if (!file.exists(metadata_path)) {
+    stop("Metadata not found: ", metadata_path)
+  }
+  
+  metadata <- read_csv(
+    metadata_path,
+    col_types = readr::cols(.default = "c"),
+    show_col_types = FALSE
+  )
+
+  if (!"SampleName" %in% names(metadata)) {
+    stop("SampleName column missing: ", accession)
+  }
+  
+  # `SampleName` must uniquely identify each biological sample in the count matrix
+  if (anyNA(metadata$SampleName) ||
+      anyDuplicated(metadata$SampleName)) {
+    stop(
+      "Missing or duplicated SampleName values in ",
+      accession,
+      ". Resolve run-to-sample relationships first."
+    )
+  }
+  
+  # 3. Match raw counts with metadata:
+  # require one metadata record per count column
+  idx <- match(colnames(counts), metadata$SampleName)
+  
+  if (anyNA(idx)) {
+    stop(
+      "Samples without matching metadata in ",
+      accession, ": ",
+      paste(
+        colnames(counts)[is.na(idx)],
+        collapse = ", "
+      )
+    )
+  }
+  
+  # Reorder metadata to count matrix columns
+  metadata <- metadata[idx, , drop = FALSE]
+  
+  stopifnot(identical(colnames(counts), metadata$SampleName))
+  
+  # Add study information
+  metadata$Study <- accession
+  metadata$SRAStudy <- srp_id
+  
+  # Input disease identifies the target cohort, not the diagnosis of every sample
+  metadata$target_disease <- disease
+  
+  list(counts = counts, metadata = metadata)
+}
+
+# Retrieve counts and metadata for all input studies
+study_data <- pmap(
+  input_studies %>%
+    dplyr::select(
+      accession,
+      disease,
+      srp_id,
+      metadata_path
+    ),
+  read_study_data
+)
+
+names(study_data) <- input_studies$accession
+names(study_data)
+
+# Inspect submitted metadata attributes
+grep(
+  "^attr_",
+  names(study_data[[1]]$metadata),
+  value = TRUE
+) #map list ?
+metadata_merged
+# Retrieve gene ids per study
+gene_lists <- map(
+  study_data,
+  ~ rownames(.x$counts)
+)
+
+# Identify common genes
+gene_lists <- Reduce(
+  intersect,
+  gene_lists
+)
+
+message("Common genes across studies: ", length(gene_lists))
+
+if (length(gene_lists) == 0L) {
+  stop("No common gene ids across studies.")
+}
+
+# Align matrices using the same gene ids
+counts_merged <- map(
+  study_data,
+  ~ .x$counts[
+    gene_lists,
+    ,
+    drop = FALSE
+  ]
+)
+
+# Merge the raw count matrices (by sample columns)
+counts_merged <- do.call(
+  cbind,
+  counts_merged
+)
+
+# Validate
+stopifnot(
+  !anyDuplicated(colnames(counts_merged)),
+  !anyDuplicated(rownames(counts_merged)),
+  all(is.finite(counts_merged)),
+  all(counts_merged >= 0)
+)
+
+dim(counts_merged)
+
+# Combine all study metadata
+metadata_merged <- study_data %>%
+  map("metadata") %>%
+  bind_rows() #handles different attributes ('attr_')
+
+# Reorder according to merged count columns
+metadata_merged <- metadata_merged[
+  match(
+    colnames(counts_merged),
+    metadata_merged$SampleName
+  ),
+  ,
+  drop = FALSE
+]
+
+# All available SRA attributes
+grep(
+  "^attr_",
+  names(metadata_merged),
+  value = TRUE
+)
+
+# Diagnosis distribution, when available
+if ("attr_diagnosis" %in% names(metadata_merged)) {
+  print(
+    table(
+      metadata_merged$Study,
+      metadata_merged$attr_diagnosis,
+      useNA = "ifany"
+    )
+  )
+}
+
+# Verify correspondence
+stopifnot(
+  !anyNA(metadata_merged$SampleName),
+  identical(
+    colnames(counts_merged),
+    metadata_merged$SampleName
+  )
+)
+
+# Convert `SampleName` into row names
+metadata_merged <- column_to_rownames(metadata_merged, "SampleName")
+
+# Read human NCBI annotation
+annotation_path <- paste0(
+  #data_ncbi/annotation
+  "data_ncbi/",
+  "annotation/",
+  "Human.GRCh38.p13.annot.tsv.gz"
+)
+
+annotation <- read_tsv(
+  annotation_path,
+  show_col_types = FALSE
+)
+
+# Inspect available columns
+names(annotation)
+
+# Match annotation with merged Gene IDs
+annotation_ids <- as.character(annotation[["GeneID"]])
+
+if (anyDuplicated(annotation_ids)) {
+  stop("Duplicated gene ids in annotation.")
+}
+
+idx <- match(rownames(counts_merged), annotation_ids)
+
+# Report annotation coverage
+message(
+  "Annotated genes: ",
+  sum(!is.na(idx)),
+  " / ",
+  nrow(counts_merged)
+)
+
+if (all(is.na(idx))) {
+  stop("No gene ids matched the annotation.")
+}
+
+# Match annotation to gene order
+annotation <- as.data.frame(annotation[idx, , drop = FALSE])
+rownames(annotation) <- rownames(counts_merged)
+annotation <- annotation %>%
+  dplyr::mutate(GeneID = as.character(GeneID)) #cast num to chr
+
+# Final validation
+stopifnot(
+  identical(colnames(counts_merged), rownames(metadata_merged)),
+  identical(rownames(counts_merged), rownames(annotation))
+)
+
+# Create raw edgeR object
+dge_raw <- edgeR::DGEList(
+  counts = counts_merged,
+  samples = metadata_merged,
+  genes = annotation
+)
+
+glimpse(dge_raw)
+
+# Create dir for main outputs
+outdir <- "out_edgeR"
+
+dir.create(
+  outdir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Save DGE object
+saveRDS(
+  dge_raw,
+  file.path(outdir, "dge_raw.rds"),
+  compress = "bzip2"
+)
+
+message(
+  "Saved merged DGE object: ",
+  nrow(dge_raw), " genes and ",
+  ncol(dge_raw), " samples from ",
+  length(unique(dge_raw$samples$Study)), #Study = GSE
+  " studies."
+)
+
+# Summarize metrics per study
+dge_summary <- dge_raw$samples %>%
+  rownames_to_column("SampleName") %>%
+  dplyr::group_by(
+    Study,
+    SRAStudy,
+    target_disease
+  ) %>%
+  dplyr::summarise(
+    n_samples = n(),
+    n_genes = nrow(dge_raw),
+    total_counts = sum(lib.size),
+    median_libsize = median(lib.size),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(
+    accession = Study,
+    srp_id = SRAStudy
+  )
+print(dge_summary)
+
+# Save a summary of the merged DGE object
+write_csv(
+  dge_summary,
+  file.path(outdir, "dge_raw_summary.csv")
+)
+```
