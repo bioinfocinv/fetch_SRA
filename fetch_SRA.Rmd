@@ -21,8 +21,7 @@ Read input studies (GSE ID required in the `accession` column).
 ```{r input}
 input_studies <- tribble(
   ~accession,  ~disease,
-  "GSE125583", "AD",
-  "GSE203206", "AD"
+  "GSE173955", "AD"
 )
 glimpse(input_studies)
 
@@ -56,6 +55,13 @@ inspect_gse <- function(gse_id) {
       tibble::rownames_to_column("sample_id")
   )
   
+  # Extract sample information
+  geo_samples <- Biobase::pData(geo[[1]]) %>%
+    rownames_to_column("GSM") %>%
+    dplyr::select(GSM, title) #eg. Alzheimer's|non-Alzheimer's Disease_Biological..
+  
+  head(geo_samples)
+  
   # List supplementary files (without downloading)
   supp <- tryCatch(
     getGEOSuppFiles(
@@ -85,6 +91,7 @@ inspect_gse <- function(gse_id) {
     accession = gse_id,
     metadata = metadata,
     n_samples = nrow(metadata),
+    geo_samples = geo_samples,
     supplementary = supp,
     count_files = count_files
   )
@@ -95,7 +102,20 @@ gse_info <- map(
   input_studies$accession,
   inspect_gse
 )
+
+# Name inspection results by GEO accession
+names(gse_info) <- input_studies$accession
+
+# Add GEO sample metadata to input studies
+input_studies <- input_studies %>%
+  dplyr::mutate(
+    geo_samples = map(
+      accession,
+      ~ gse_info[[.x]]$geo_samples
+    )
+  )
 ```
+
 ## Download NCBI-computed gene counts
 
 ```{r rawcounts}
@@ -658,12 +678,96 @@ input_studies <- input_studies %>%
 Validate the retrieved data and create an exportable DGEList object compatible with edgeR for downstream analysis. If multiple GSE studies are available, combine their count matrices by columns and export them as a single file. In addition, generate a summary report (`dge_raw_summary.csv`) describing the processed accession studies and general dataset metrics, such as the number of samples and genes.
 
 ```{r export}
-# Helper function to retrieve the count matrix and its corresponding metadata
+# Function to collapse duplicated metadata
+collapse_sra_metadata <- function(metadata) {
+  stopifnot("SampleName" %in% names(metadata))
+  
+  if (anyNA(metadata$SampleName) ||
+      any(!nzchar(trimws(metadata$SampleName)))) {
+    stop("Missing or empty SampleName values.")
+  }
+  
+  # Check biological sample identity
+  if ("BioSample" %in% names(metadata)) {
+    conflicts <- metadata %>%
+      dplyr::group_by(SampleName) %>%
+      dplyr::summarise(
+        n_biosamples = n_distinct(
+          BioSample[!is.na(BioSample) & nzchar(BioSample)]
+        ),
+        .groups = "drop"
+      ) %>%
+      dplyr::filter(n_biosamples > 1)
+    
+    if (nrow(conflicts) > 0) {
+      stop(
+        "Different BioSample identifiers share a SampleName: ",
+        paste(conflicts$SampleName, collapse = ", ")
+      )
+    }
+  }
+  
+  # Check conflicting submitted biological attributes
+  attr_cols <- grep(
+    "^attr_",
+    names(metadata),
+    value = TRUE
+  )
+  
+  for (col in attr_cols) {
+    conflicts <- metadata %>%
+      dplyr::group_by(SampleName) %>%
+      dplyr::summarise(
+        n_values = n_distinct(
+          .data[[col]][
+            !is.na(.data[[col]]) &
+              nzchar(trimws(.data[[col]]))
+          ]
+        ),
+        .groups = "drop"
+      ) %>%
+      dplyr::filter(n_values > 1)
+    
+    if (nrow(conflicts) > 0) {
+      stop(
+        "Conflicting values in ", col,
+        " for SampleName: ",
+        paste(conflicts$SampleName, collapse = ", ")
+      )
+    }
+  }
+  
+  # Collapse repeated runs
+  metadata <- metadata %>%
+    dplyr::group_by(SampleName) %>%
+    dplyr::summarise(
+      across(
+        everything(),
+        ~ {
+          values <- unique(
+            .x[!is.na(.x) & nzchar(trimws(.x))]
+          )
+          
+          if (length(values) == 0) {
+            NA_character_
+          } else {
+            paste(values, collapse = "; ") #eg. SRR1001; SRR1002..
+          }
+        }
+      ),
+      .groups = "drop"
+    )
+  
+  metadata
+}
+
+# Function to retrieve the count matrix and its corresponding metadata
 read_study_data <- function(
     accession,
     disease,
     srp_id,
     metadata_path,
+    geo_samples,
     counts_dir = "data_ncbi/counts"
   ) {
   
@@ -721,20 +825,61 @@ read_study_data <- function(
     col_types = readr::cols(.default = "c"),
     show_col_types = FALSE
   )
-
+  
   if (!"SampleName" %in% names(metadata)) {
     stop("SampleName column missing: ", accession)
   }
   
-  # `SampleName` must uniquely identify each biological sample in the count matrix
-  if (anyNA(metadata$SampleName) ||
-      anyDuplicated(metadata$SampleName)) {
-    stop(
-      "Missing or duplicated SampleName values in ",
-      accession,
-      ". Resolve run-to-sample relationships first."
+  # Check repeated `SampleName` values
+  n_runs <- nrow(metadata)
+  n_samples <- n_distinct(metadata$SampleName)
+  
+  if (n_runs > n_samples) {
+    message(
+      accession, ": ",
+      n_runs, " sequencing runs across ",
+      n_samples, " unique SampleName values."
+    )
+    
+    # Collapse duplicated sample metadata
+    metadata <- collapse_sra_metadata(metadata)
+    
+    message(
+      "Metadata collapsed to ",
+      nrow(metadata),
+      " unique samples."
     )
   }
+  
+  # Validate resulting metadata
+  stopifnot(
+    !anyNA(metadata$SampleName),
+    !anyDuplicated(metadata$SampleName)
+  )
+  
+  # Optional: add GEO sample titles
+  stopifnot(
+    all(c("GSM", "title") %in% names(geo_samples)),
+    !anyDuplicated(geo_samples$GSM)
+  )
+  
+  # Match GEO metadata using `SampleName`
+  idx_geo <- match(
+    metadata$SampleName,
+    geo_samples$GSM
+  )
+  
+  # Preserve original GEO titles
+  metadata$attr_geo_title <- geo_samples$title[idx_geo]
+  
+  # Report matching
+  message(
+    accession, ": ",
+    sum(!is.na(idx_geo)),
+    " / ",
+    nrow(metadata),
+    " samples matched to GEO titles."
+  )
   
   # 3. Match raw counts with metadata:
   # require one metadata record per count column
@@ -773,7 +918,8 @@ study_data <- pmap(
       accession,
       disease,
       srp_id,
-      metadata_path
+      metadata_path,
+      geo_samples
     ),
   read_study_data
 )
@@ -927,7 +1073,7 @@ stopifnot(
 )
 
 # Create raw edgeR object
-dge_raw <- edgeR::DGEList(
+dge_raw <- DGEList(
   counts = counts_merged,
   samples = metadata_merged,
   genes = annotation
