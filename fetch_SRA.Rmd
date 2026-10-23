@@ -7,31 +7,36 @@ output: html_document
 
 ```{r setup include=FALSE}
 suppressMessages(library(tidyverse)) #tidy ecosystem
-suppressMessages(library(purrr)) #mapping functions
-suppressMessages(library(GEOquery)) #GSE accession
-suppressMessages(library(rentrez)) #NCBI Eutils API
-suppressMessages(library(recount3)) #uniformly processed RNA-seq data
 suppressMessages(library(edgeR)) #DGE objects
+suppressMessages(library(GEOquery)) #GSE accession
+suppressMessages(library(purrr)) #mapping functions
+suppressMessages(library(rentrez)) #NCBI Eutils API
 ```
 
 ## Input studies
 
-Read input studies (GSE ID required in the `accession` column).
+Read input studies and diseases (GSE ID is required in the `accession` column).
 
 ```{r input}
-input_studies <- tribble(
-  ~accession,  ~disease,
-  "GSE173955", "AD"
+# Read config file
+input_studies <- read_csv(
+  "config/studies_AD.csv",
+  col_types = cols(.default = "c"),
+  show_col_types = FALSE
 )
-glimpse(input_studies)
 
-# Or read config file instead
-#input_studies <- read.csv("config/input_studies.csv")
+# Validate columns
+if (!"accession" %in% colnames(input_studies)) {
+  message("Columns are: ", paste(colnames(input_studies), collapse = ", "))
+  stop("Input config file needs an accession column.", call. = FALSE)
+}
 
 # Validate only GSE
 if (!all(grepl("^GSE[0-9]+$", input_studies$accession))) {
   stop("All accession values must be valid GSE accessions.", call. = FALSE)
 }
+
+glimpse(input_studies)
 ```
 
 ## Inspect input GSE studies
@@ -294,7 +299,7 @@ resolve_srp_entrez <- function(gse_id) {
   
   runinfo <- read_csv(
     I(csv_text),
-    col_types = readr::cols(.default = "c"),
+    col_types = cols(.default = "c"),
     show_col_types = FALSE
   )
   
@@ -822,7 +827,7 @@ read_study_data <- function(
   
   metadata <- read_csv(
     metadata_path,
-    col_types = readr::cols(.default = "c"),
+    col_types = cols(.default = "c"),
     show_col_types = FALSE
   )
   
