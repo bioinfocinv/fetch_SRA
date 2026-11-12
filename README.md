@@ -13,19 +13,6 @@ The workflow provides functions to:
 - Integrate gene counts, sample metadata, and gene annotations into `edgeR::DGEList` objects (main output).
 - Validate count matrices and sample correspondence before exporting processed objects.
 
-## Requirements
-
-The workflow is implemented in **R** using the following packages:
-
-- `Biobase`
-- `edgeR`
-- `GEOquery`
-- `rentrez`
-- `recount3`
-- `purrr`
-- `tidyverse`
-- `xml2`
-
 ## Input Data
 
 The pipeline accepts GEO (`GSE`) accessions for metadata retrieval. NCBI-generated gene count downloads and `DGEList` construction use GSE identifiers.
@@ -57,4 +44,5 @@ out_edgeR/
 ## Author
 
 **Moises A. Rojas**
+
 Laboratory of Genomics and Evolution (MolEvol lab) @CINV 2026
